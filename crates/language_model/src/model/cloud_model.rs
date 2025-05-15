@@ -90,6 +90,8 @@ impl CloudModel {
                 | open_ai::Model::O1Preview
                 | open_ai::Model::O1
                 | open_ai::Model::O3Mini
+                | open_ai::Model::O3
+                | open_ai::Model::O4Mini
                 | open_ai::Model::Custom { .. } => {
                     LanguageModelAvailability::RequiresPlan(Plan::ZedPro)
                 }
@@ -103,6 +105,7 @@ impl CloudModel {
                 | google_ai::Model::Gemini20FlashLite
                 | google_ai::Model::Gemini25ProExp0325
                 | google_ai::Model::Gemini25ProPreview0325
+                | google_ai::Model::Gemini25FlashPreview0417
                 | google_ai::Model::Custom { .. } => {
                     LanguageModelAvailability::RequiresPlan(Plan::ZedPro)
                 }
@@ -126,18 +129,6 @@ impl fmt::Display for PaymentRequiredError {
         write!(
             f,
             "Payment required to use this language model. Please upgrade your account."
-        )
-    }
-}
-
-#[derive(Error, Debug)]
-pub struct MaxMonthlySpendReachedError;
-
-impl fmt::Display for MaxMonthlySpendReachedError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(
-            f,
-            "Maximum spending limit reached for this month. For more usage, increase your spending limit."
         )
     }
 }

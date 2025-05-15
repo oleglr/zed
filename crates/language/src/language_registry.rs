@@ -68,6 +68,12 @@ impl From<LanguageName> for SharedString {
     }
 }
 
+impl From<SharedString> for LanguageName {
+    fn from(value: SharedString) -> Self {
+        LanguageName(value)
+    }
+}
+
 impl AsRef<str> for LanguageName {
     fn as_ref(&self) -> &str {
         self.0.as_ref()
@@ -104,7 +110,6 @@ pub struct LanguageRegistry {
     language_server_download_dir: Option<Arc<Path>>,
     executor: BackgroundExecutor,
     lsp_binary_status_tx: BinaryStatusSender,
-    dap_binary_status_tx: BinaryStatusSender,
 }
 
 struct LanguageRegistryState {
@@ -162,6 +167,7 @@ impl AvailableLanguage {
     pub fn matcher(&self) -> &LanguageMatcher {
         &self.matcher
     }
+
     pub fn hidden(&self) -> bool {
         self.hidden
     }
@@ -214,6 +220,7 @@ pub const QUERY_FILENAME_PREFIXES: &[(
     ("overrides", |q| &mut q.overrides),
     ("redactions", |q| &mut q.redactions),
     ("runnables", |q| &mut q.runnables),
+    ("debug_variables", |q| &mut q.debug_variables),
     ("textobjects", |q| &mut q.text_objects),
 ];
 
@@ -230,6 +237,7 @@ pub struct LanguageQueries {
     pub redactions: Option<Cow<'static, str>>,
     pub runnables: Option<Cow<'static, str>>,
     pub text_objects: Option<Cow<'static, str>>,
+    pub debug_variables: Option<Cow<'static, str>>,
 }
 
 #[derive(Clone, Default)]
@@ -267,7 +275,6 @@ impl LanguageRegistry {
             }),
             language_server_download_dir: None,
             lsp_binary_status_tx: Default::default(),
-            dap_binary_status_tx: Default::default(),
             executor,
         };
         this.add(PLAIN_TEXT.clone());
@@ -624,6 +631,22 @@ impl LanguageRegistry {
                 .then_some(LanguageMatchPrecedence::PathOrContent)
         });
         async move { rx.await? }
+    }
+
+    pub fn language_name_for_extension(self: &Arc<Self>, extension: &str) -> Option<LanguageName> {
+        self.state.try_read().and_then(|state| {
+            state
+                .available_languages
+                .iter()
+                .find(|language| {
+                    language
+                        .matcher()
+                        .path_suffixes
+                        .iter()
+                        .any(|suffix| *suffix == extension)
+                })
+                .map(|language| language.name.clone())
+        })
     }
 
     pub fn language_for_name_or_extension(
@@ -984,10 +1007,6 @@ impl LanguageRegistry {
         self.lsp_binary_status_tx.send(server_name.0, status);
     }
 
-    pub fn update_dap_status(&self, server_name: LanguageServerName, status: BinaryStatus) {
-        self.dap_binary_status_tx.send(server_name.0, status);
-    }
-
     pub fn next_language_server_id(&self) -> LanguageServerId {
         self.state.write().next_language_server_id()
     }
@@ -1042,12 +1061,6 @@ impl LanguageRegistry {
         &self,
     ) -> mpsc::UnboundedReceiver<(SharedString, BinaryStatus)> {
         self.lsp_binary_status_tx.subscribe()
-    }
-
-    pub fn dap_server_binary_statuses(
-        &self,
-    ) -> mpsc::UnboundedReceiver<(SharedString, BinaryStatus)> {
-        self.dap_binary_status_tx.subscribe()
     }
 
     pub async fn delete_server_container(&self, name: LanguageServerName) {
