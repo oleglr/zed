@@ -77,16 +77,28 @@ impl FeatureFlag for NotebookFeatureFlag {
     const NAME: &'static str = "notebooks";
 }
 
-pub struct DebuggerFeatureFlag {}
-impl FeatureFlag for DebuggerFeatureFlag {
-    const NAME: &'static str = "debugger";
-}
-
 pub struct ThreadAutoCaptureFeatureFlag {}
 impl FeatureFlag for ThreadAutoCaptureFeatureFlag {
     const NAME: &'static str = "thread-auto-capture";
 
     fn enabled_for_staff() -> bool {
+        false
+    }
+}
+
+pub struct JjUiFeatureFlag {}
+
+impl FeatureFlag for JjUiFeatureFlag {
+    const NAME: &'static str = "jj-ui";
+}
+
+pub struct ZedCloudFeatureFlag {}
+
+impl FeatureFlag for ZedCloudFeatureFlag {
+    const NAME: &'static str = "zed-cloud";
+
+    fn enabled_for_staff() -> bool {
+        // Require individual opt-in, for now.
         false
     }
 }

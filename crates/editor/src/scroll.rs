@@ -13,6 +13,7 @@ use crate::{
 pub use autoscroll::{Autoscroll, AutoscrollStrategy};
 use core::fmt::Debug;
 use gpui::{App, Axis, Context, Global, Pixels, Task, Window, point, px};
+use language::language_settings::{AllLanguageSettings, SoftWrap};
 use language::{Bias, Point};
 pub use scroll_amount::ScrollAmount;
 use settings::Settings;
@@ -123,8 +124,9 @@ impl OngoingScroll {
     }
 }
 
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Copy, Clone, Default, PartialEq, Eq)]
 pub enum ScrollbarThumbState {
+    #[default]
     Idle,
     Hovered,
     Dragging,
@@ -150,15 +152,18 @@ pub struct ScrollManager {
     pub(crate) vertical_scroll_margin: f32,
     anchor: ScrollAnchor,
     ongoing: OngoingScroll,
+    /// The second element indicates whether the autoscroll request is local
+    /// (true) or remote (false). Local requests are initiated by user actions,
+    /// while remote requests come from external sources.
     autoscroll_request: Option<(Autoscroll, bool)>,
     last_autoscroll: Option<(gpui::Point<f32>, f32, f32, AutoscrollStrategy)>,
     show_scrollbars: bool,
     hide_scrollbar_task: Option<Task<()>>,
     active_scrollbar: Option<ActiveScrollbarState>,
     visible_line_count: Option<f32>,
+    visible_column_count: Option<f32>,
     forbid_vertical_scroll: bool,
-    dragging_minimap: bool,
-    show_minimap_thumb: bool,
+    minimap_thumb_state: Option<ScrollbarThumbState>,
 }
 
 impl ScrollManager {
@@ -173,9 +178,9 @@ impl ScrollManager {
             active_scrollbar: None,
             last_autoscroll: None,
             visible_line_count: None,
+            visible_column_count: None,
             forbid_vertical_scroll: false,
-            dragging_minimap: false,
-            show_minimap_thumb: false,
+            minimap_thumb_state: None,
         }
     }
 
@@ -211,10 +216,26 @@ impl ScrollManager {
         window: &mut Window,
         cx: &mut Context<Editor>,
     ) {
-        let (new_anchor, top_row) = if scroll_position.y <= 0. {
+        let (new_anchor, top_row) = if scroll_position.y <= 0. && scroll_position.x <= 0. {
             (
                 ScrollAnchor {
                     anchor: Anchor::min(),
+                    offset: scroll_position.max(&gpui::Point::default()),
+                },
+                0,
+            )
+        } else if scroll_position.y <= 0. {
+            let buffer_point = map
+                .clip_point(
+                    DisplayPoint::new(DisplayRow(0), scroll_position.x as u32),
+                    Bias::Left,
+                )
+                .to_point(map);
+            let anchor = map.buffer_snapshot.anchor_at(buffer_point, Bias::Right);
+
+            (
+                ScrollAnchor {
+                    anchor: anchor,
                     offset: scroll_position.max(&gpui::Point::default()),
                 },
                 0,
@@ -243,8 +264,13 @@ impl ScrollManager {
                 }
             };
 
-            let scroll_top_buffer_point =
-                DisplayPoint::new(DisplayRow(scroll_top as u32), 0).to_point(map);
+            let scroll_top_row = DisplayRow(scroll_top as u32);
+            let scroll_top_buffer_point = map
+                .clip_point(
+                    DisplayPoint::new(scroll_top_row, scroll_position.x as u32),
+                    Bias::Left,
+                )
+                .to_point(map);
             let top_anchor = map
                 .buffer_snapshot
                 .anchor_at(scroll_top_buffer_point, Bias::Right);
@@ -345,24 +371,6 @@ impl ScrollManager {
         self.show_scrollbars
     }
 
-    pub fn show_minimap_thumb(&mut self, cx: &mut Context<Editor>) {
-        if !self.show_minimap_thumb {
-            self.show_minimap_thumb = true;
-            cx.notify();
-        }
-    }
-
-    pub fn hide_minimap_thumb(&mut self, cx: &mut Context<Editor>) {
-        if self.show_minimap_thumb {
-            self.show_minimap_thumb = false;
-            cx.notify();
-        }
-    }
-
-    pub fn minimap_thumb_visible(&mut self) -> bool {
-        self.show_minimap_thumb
-    }
-
     pub fn autoscroll_request(&self) -> Option<Autoscroll> {
         self.autoscroll_request.map(|(autoscroll, _)| autoscroll)
     }
@@ -374,6 +382,7 @@ impl ScrollManager {
     pub fn dragging_scrollbar_axis(&self) -> Option<Axis> {
         self.active_scrollbar
             .as_ref()
+            .filter(|scrollbar| scrollbar.thumb_state == ScrollbarThumbState::Dragging)
             .map(|scrollbar| scrollbar.axis)
     }
 
@@ -418,13 +427,43 @@ impl ScrollManager {
         }
     }
 
-    pub fn is_dragging_minimap(&self) -> bool {
-        self.dragging_minimap
+    pub fn set_is_hovering_minimap_thumb(&mut self, hovered: bool, cx: &mut Context<Editor>) {
+        self.update_minimap_thumb_state(
+            Some(if hovered {
+                ScrollbarThumbState::Hovered
+            } else {
+                ScrollbarThumbState::Idle
+            }),
+            cx,
+        );
     }
 
-    pub fn set_is_dragging_minimap(&mut self, dragging: bool, cx: &mut Context<Editor>) {
-        self.dragging_minimap = dragging;
-        cx.notify();
+    pub fn set_is_dragging_minimap(&mut self, cx: &mut Context<Editor>) {
+        self.update_minimap_thumb_state(Some(ScrollbarThumbState::Dragging), cx);
+    }
+
+    pub fn hide_minimap_thumb(&mut self, cx: &mut Context<Editor>) {
+        self.update_minimap_thumb_state(None, cx);
+    }
+
+    pub fn is_dragging_minimap(&self) -> bool {
+        self.minimap_thumb_state
+            .is_some_and(|state| state == ScrollbarThumbState::Dragging)
+    }
+
+    fn update_minimap_thumb_state(
+        &mut self,
+        thumb_state: Option<ScrollbarThumbState>,
+        cx: &mut Context<Editor>,
+    ) {
+        if self.minimap_thumb_state != thumb_state {
+            self.minimap_thumb_state = thumb_state;
+            cx.notify();
+        }
+    }
+
+    pub fn minimap_thumb_state(&self) -> Option<ScrollbarThumbState> {
+        self.minimap_thumb_state
     }
 
     pub fn clamp_scroll_left(&mut self, max: f32) -> bool {
@@ -464,6 +503,10 @@ impl Editor {
             .map(|line_count| line_count as u32 - 1)
     }
 
+    pub fn visible_column_count(&self) -> Option<f32> {
+        self.scroll_manager.visible_column_count
+    }
+
     pub(crate) fn set_visible_line_count(
         &mut self,
         lines: f32,
@@ -475,13 +518,18 @@ impl Editor {
         if opened_first_time {
             cx.spawn_in(window, async move |editor, cx| {
                 editor
-                    .update(cx, |editor, cx| {
-                        editor.refresh_inlay_hints(InlayHintRefreshReason::NewLinesShown, cx)
+                    .update_in(cx, |editor, window, cx| {
+                        editor.refresh_inlay_hints(InlayHintRefreshReason::NewLinesShown, cx);
+                        editor.refresh_colors(false, None, window, cx);
                     })
                     .ok()
             })
             .detach()
         }
+    }
+
+    pub(crate) fn set_visible_column_count(&mut self, columns: f32) {
+        self.scroll_manager.visible_column_count = Some(columns);
     }
 
     pub fn apply_scroll_delta(
@@ -587,6 +635,7 @@ impl Editor {
         );
 
         self.refresh_inlay_hints(InlayHintRefreshReason::NewLinesShown, cx);
+        self.refresh_colors(false, None, window, cx);
     }
 
     pub fn scroll_position(&self, cx: &mut Context<Self>) -> gpui::Point<f32> {
@@ -657,18 +706,52 @@ impl Editor {
             return;
         }
 
-        let cur_position = self.scroll_position(cx);
+        let mut current_position = self.scroll_position(cx);
         let Some(visible_line_count) = self.visible_line_count() else {
             return;
         };
-        let new_pos = cur_position + point(0., amount.lines(visible_line_count));
-        self.set_scroll_position(new_pos, window, cx);
+        let Some(mut visible_column_count) = self.visible_column_count() else {
+            return;
+        };
+
+        // If the user has a preferred line length, and has the editor
+        // configured to wrap at the preferred line length, or bounded to it,
+        // use that value over the visible column count. This was mostly done so
+        // that tests could actually be written for vim's `z l`, `z h`, `z
+        // shift-l` and `z shift-h` commands, as there wasn't a good way to
+        // configure the editor to only display a certain number of columns. If
+        // that ever happens, this could probably be removed.
+        let settings = AllLanguageSettings::get_global(cx);
+        if matches!(
+            settings.defaults.soft_wrap,
+            SoftWrap::PreferredLineLength | SoftWrap::Bounded
+        ) {
+            if (settings.defaults.preferred_line_length as f32) < visible_column_count {
+                visible_column_count = settings.defaults.preferred_line_length as f32;
+            }
+        }
+
+        // If the scroll position is currently at the left edge of the document
+        // (x == 0.0) and the intent is to scroll right, the gutter's margin
+        // should first be added to the current position, otherwise the cursor
+        // will end at the column position minus the margin, which looks off.
+        if current_position.x == 0.0 && amount.columns(visible_column_count) > 0. {
+            if let Some(last_position_map) = &self.last_position_map {
+                current_position.x += self.gutter_dimensions.margin / last_position_map.em_advance;
+            }
+        }
+        let new_position = current_position
+            + point(
+                amount.columns(visible_column_count),
+                amount.lines(visible_line_count),
+            );
+        self.set_scroll_position(new_position, window, cx);
     }
 
     /// Returns an ordering. The newest selection is:
     ///     Ordering::Equal => on screen
-    ///     Ordering::Less => above the screen
-    ///     Ordering::Greater => below the screen
+    ///     Ordering::Less => above or to the left of the screen
+    ///     Ordering::Greater => below or to the right of the screen
     pub fn newest_selection_on_screen(&self, cx: &mut App) -> Ordering {
         let snapshot = self.display_map.update(cx, |map, cx| map.snapshot(cx));
         let newest_head = self
@@ -686,8 +769,12 @@ impl Editor {
             return Ordering::Less;
         }
 
-        if let Some(visible_lines) = self.visible_line_count() {
-            if newest_head.row() <= DisplayRow(screen_top.row().0 + visible_lines as u32) {
+        if let (Some(visible_lines), Some(visible_columns)) =
+            (self.visible_line_count(), self.visible_column_count())
+        {
+            if newest_head.row() <= DisplayRow(screen_top.row().0 + visible_lines as u32)
+                && newest_head.column() <= screen_top.column() + visible_columns as u32
+            {
                 return Ordering::Equal;
             }
         }

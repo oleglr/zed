@@ -14,9 +14,10 @@ use collections::{BTreeMap, BTreeSet, HashMap, HashSet, btree_map};
 pub use extension::ExtensionManifest;
 use extension::extension_builder::{CompileExtensionOptions, ExtensionBuilder};
 use extension::{
-    ExtensionContextServerProxy, ExtensionEvents, ExtensionGrammarProxy, ExtensionHostProxy,
-    ExtensionIndexedDocsProviderProxy, ExtensionLanguageProxy, ExtensionLanguageServerProxy,
-    ExtensionSlashCommandProxy, ExtensionSnippetProxy, ExtensionThemeProxy,
+    ExtensionContextServerProxy, ExtensionDebugAdapterProviderProxy, ExtensionEvents,
+    ExtensionGrammarProxy, ExtensionHostProxy, ExtensionIndexedDocsProviderProxy,
+    ExtensionLanguageProxy, ExtensionLanguageServerProxy, ExtensionSlashCommandProxy,
+    ExtensionSnippetProxy, ExtensionThemeProxy,
 };
 use fs::{Fs, RemoveOptions};
 use futures::{
@@ -53,7 +54,7 @@ use std::{
     time::{Duration, Instant},
 };
 use url::Url;
-use util::ResultExt;
+use util::{ResultExt, paths::RemotePathBuf};
 use wasm_host::{
     WasmExtension, WasmHost,
     wit::{is_supported_wasm_api_version, wasm_api_version_range},
@@ -131,6 +132,7 @@ pub enum Event {
     ExtensionsUpdated,
     StartedReloading,
     ExtensionInstalled(Arc<str>),
+    ExtensionUninstalled(Arc<str>),
     ExtensionFailedToLoad(Arc<str>),
 }
 
@@ -176,7 +178,13 @@ pub struct ExtensionIndexLanguageEntry {
     pub grammar: Option<Arc<str>>,
 }
 
-actions!(zed, [ReloadExtensions]);
+actions!(
+    zed,
+    [
+        /// Reloads all installed extensions.
+        ReloadExtensions
+    ]
+);
 
 pub fn init(
     extension_host_proxy: Arc<ExtensionHostProxy>,
@@ -716,7 +724,7 @@ impl ExtensionStore {
             let mut response = http_client
                 .get(url.as_ref(), Default::default(), true)
                 .await
-                .map_err(|err| anyhow!("error downloading extension: {}", err))?;
+                .context("downloading extension")?;
 
             fs.remove_dir(
                 &extension_dir,
@@ -836,13 +844,19 @@ impl ExtensionStore {
         self.install_or_upgrade_extension_at_endpoint(extension_id, url, operation, cx)
     }
 
-    pub fn uninstall_extension(&mut self, extension_id: Arc<str>, cx: &mut Context<Self>) {
+    pub fn uninstall_extension(
+        &mut self,
+        extension_id: Arc<str>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
         let extension_dir = self.installed_dir.join(extension_id.as_ref());
         let work_dir = self.wasm_host.work_dir.join(extension_id.as_ref());
         let fs = self.fs.clone();
 
+        let extension_manifest = self.extension_manifest_for_id(&extension_id).cloned();
+
         match self.outstanding_operations.entry(extension_id.clone()) {
-            btree_map::Entry::Occupied(_) => return,
+            btree_map::Entry::Occupied(_) => return Task::ready(Ok(())),
             btree_map::Entry::Vacant(e) => e.insert(ExtensionOperation::Remove),
         };
 
@@ -877,9 +891,19 @@ impl ExtensionStore {
             )
             .await?;
 
+            this.update(cx, |_, cx| {
+                cx.emit(Event::ExtensionUninstalled(extension_id.clone()));
+                if let Some(events) = ExtensionEvents::try_global(cx) {
+                    if let Some(manifest) = extension_manifest {
+                        events.update(cx, |this, cx| {
+                            this.emit(extension::Event::ExtensionUninstalled(manifest.clone()), cx)
+                        });
+                    }
+                }
+            })?;
+
             anyhow::Ok(())
         })
-        .detach_and_log_err(cx)
     }
 
     pub fn install_dev_extension(
@@ -1134,6 +1158,12 @@ impl ExtensionStore {
             for (server_id, _) in extension.manifest.context_servers.iter() {
                 self.proxy.unregister_context_server(server_id.clone(), cx);
             }
+            for (adapter, _) in extension.manifest.debug_adapters.iter() {
+                self.proxy.unregister_debug_adapter(adapter.clone());
+            }
+            for (locator, _) in extension.manifest.debug_locators.iter() {
+                self.proxy.unregister_debug_locator(locator.clone());
+            }
         }
 
         self.wasm_extensions
@@ -1328,6 +1358,28 @@ impl ExtensionStore {
                         this.proxy
                             .register_indexed_docs_provider(extension.clone(), provider_id.clone());
                     }
+
+                    for (debug_adapter, meta) in &manifest.debug_adapters {
+                        let mut path = root_dir.clone();
+                        path.push(Path::new(manifest.id.as_ref()));
+                        if let Some(schema_path) = &meta.schema_path {
+                            path.push(schema_path);
+                        } else {
+                            path.push("debug_adapter_schemas");
+                            path.push(Path::new(debug_adapter.as_ref()).with_extension("json"));
+                        }
+
+                        this.proxy.register_debug_adapter(
+                            extension.clone(),
+                            debug_adapter.clone(),
+                            &path,
+                        );
+                    }
+
+                    for debug_adapter in manifest.debug_locators.keys() {
+                        this.proxy
+                            .register_debug_locator(extension.clone(), debug_adapter.clone());
+                    }
                 }
 
                 this.wasm_extensions.extend(wasm_extensions);
@@ -1409,7 +1461,7 @@ impl ExtensionStore {
         let is_dev = fs
             .metadata(&extension_dir)
             .await?
-            .ok_or_else(|| anyhow!("directory does not exist"))?
+            .context("directory does not exist")?
             .is_symlink;
 
         if let Ok(mut language_paths) = fs.read_dir(&extension_dir.join("languages")).await {
@@ -1587,6 +1639,23 @@ impl ExtensionStore {
                 }
             }
 
+            for (adapter_name, meta) in loaded_extension.manifest.debug_adapters.iter() {
+                let schema_path = &extension::build_debug_adapter_schema_path(adapter_name, meta);
+
+                if fs.is_file(&src_dir.join(schema_path)).await {
+                    match schema_path.parent() {
+                        Some(parent) => fs.create_dir(&tmp_dir.join(parent)).await?,
+                        None => {}
+                    }
+                    fs.copy_file(
+                        &src_dir.join(schema_path),
+                        &tmp_dir.join(schema_path),
+                        fs::CopyOptions::default(),
+                    )
+                    .await?
+                }
+            }
+
             Ok(())
         })
     }
@@ -1601,7 +1670,7 @@ impl ExtensionStore {
                 .extensions
                 .iter()
                 .filter_map(|(id, entry)| {
-                    if entry.manifest.language_servers.is_empty() {
+                    if !entry.manifest.allow_remote_load() {
                         return None;
                     }
                     Some(proto::Extension {
@@ -1620,6 +1689,7 @@ impl ExtensionStore {
                     .request(proto::SyncExtensions { extensions })
             })?
             .await?;
+        let path_style = client.read_with(cx, |client, _| client.path_style())?;
 
         for missing_extension in response.missing_extensions.into_iter() {
             let tmp_dir = tempfile::tempdir()?;
@@ -1632,7 +1702,10 @@ impl ExtensionStore {
                 )
             })?
             .await?;
-            let dest_dir = PathBuf::from(&response.tmp_dir).join(missing_extension.clone().id);
+            let dest_dir = RemotePathBuf::new(
+                PathBuf::from(&response.tmp_dir).join(missing_extension.clone().id),
+                path_style,
+            );
             log::info!("Uploading extension {}", missing_extension.clone().id);
 
             client
@@ -1649,7 +1722,7 @@ impl ExtensionStore {
             client
                 .update(cx, |client, _cx| {
                     client.proto_client().request(proto::InstallExtension {
-                        tmp_dir: dest_dir.to_string_lossy().to_string(),
+                        tmp_dir: dest_dir.to_proto(),
                         extension: Some(missing_extension),
                     })
                 })?
@@ -1676,12 +1749,15 @@ impl ExtensionStore {
 
     pub fn register_ssh_client(&mut self, client: Entity<SshRemoteClient>, cx: &mut Context<Self>) {
         let connection_options = client.read(cx).connection_options();
-        if self.ssh_clients.contains_key(&connection_options.ssh_url()) {
-            return;
+        let ssh_url = connection_options.ssh_url();
+
+        if let Some(existing_client) = self.ssh_clients.get(&ssh_url) {
+            if existing_client.upgrade().is_some() {
+                return;
+            }
         }
 
-        self.ssh_clients
-            .insert(connection_options.ssh_url(), client.downgrade());
+        self.ssh_clients.insert(ssh_url, client.downgrade());
         self.ssh_registered_tx.unbounded_send(()).ok();
     }
 }

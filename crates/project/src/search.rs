@@ -404,6 +404,9 @@ impl SearchQuery {
                                     let start = line_offset + mat.start();
                                     let end = line_offset + mat.end();
                                     matches.push(start..end);
+                                    if self.one_match_per_line() == Some(true) {
+                                        break;
+                                    }
                                 }
 
                                 line_offset += line.len() + 1;
@@ -521,10 +524,8 @@ pub fn deserialize_path_matches(glob_set: &str) -> anyhow::Result<PathMatcher> {
     let globs = glob_set
         .split(',')
         .map(str::trim)
-        .filter(|&glob_str| (!glob_str.is_empty()))
-        .map(|glob_str| glob_str.to_owned())
-        .collect::<Vec<_>>();
-    Ok(PathMatcher::new(&globs)?)
+        .filter(|&glob_str| !glob_str.is_empty());
+    Ok(PathMatcher::new(globs)?)
 }
 
 #[cfg(test)]

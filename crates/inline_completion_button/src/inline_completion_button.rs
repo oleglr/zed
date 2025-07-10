@@ -2,7 +2,7 @@ use anyhow::Result;
 use client::{UserStore, zed_urls};
 use copilot::{Copilot, Status};
 use editor::{
-    Editor,
+    Editor, SelectionEffects,
     actions::{ShowEditPrediction, ToggleEditPrediction},
     scroll::Autoscroll,
 };
@@ -37,7 +37,13 @@ use zed_actions::OpenBrowser;
 use zed_llm_client::UsageLimit;
 use zeta::RateCompletions;
 
-actions!(edit_prediction, [ToggleMenu]);
+actions!(
+    edit_prediction,
+    [
+        /// Toggles the inline completion menu.
+        ToggleMenu
+    ]
+);
 
 const COPILOT_SETTINGS_URL: &str = "https://github.com/settings/copilot";
 
@@ -277,14 +283,31 @@ impl Render for InlineCompletionButton {
                     );
                 }
 
+                let mut over_limit = false;
+
+                if let Some(usage) = self
+                    .edit_prediction_provider
+                    .as_ref()
+                    .and_then(|provider| provider.usage(cx))
+                {
+                    over_limit = usage.over_limit()
+                }
+
                 let show_editor_predictions = self.editor_show_predictions;
 
                 let icon_button = IconButton::new("zed-predict-pending-button", zeta_icon)
                     .shape(IconButtonShape::Square)
-                    .when(enabled && !show_editor_predictions, |this| {
-                        this.indicator(Indicator::dot().color(Color::Muted))
+                    .when(
+                        enabled && (!show_editor_predictions || over_limit),
+                        |this| {
+                            this.indicator(Indicator::dot().when_else(
+                                over_limit,
+                                |dot| dot.color(Color::Error),
+                                |dot| dot.color(Color::Muted),
+                            ))
                             .indicator_border_color(Some(cx.theme().colors().status_bar_background))
-                    })
+                        },
+                    )
                     .when(!self.popover_menu_handle.is_deployed(), |element| {
                         element.tooltip(move |window, cx| {
                             if enabled {
@@ -402,46 +425,6 @@ impl InlineCompletionButton {
     ) -> ContextMenu {
         let fs = self.fs.clone();
         let line_height = window.line_height();
-
-        if let Some(usage) = self
-            .edit_prediction_provider
-            .as_ref()
-            .and_then(|provider| provider.usage(cx))
-        {
-            menu = menu.header("Usage");
-            menu = menu
-                .custom_entry(
-                    move |_window, cx| {
-                        let used_percentage = match usage.limit {
-                            UsageLimit::Limited(limit) => {
-                                Some((usage.amount as f32 / limit as f32) * 100.)
-                            }
-                            UsageLimit::Unlimited => None,
-                        };
-
-                        h_flex()
-                            .flex_1()
-                            .gap_1p5()
-                            .children(
-                                used_percentage
-                                    .map(|percent| ProgressBar::new("usage", percent, 100., cx)),
-                            )
-                            .child(
-                                Label::new(match usage.limit {
-                                    UsageLimit::Limited(limit) => {
-                                        format!("{} / {limit}", usage.amount)
-                                    }
-                                    UsageLimit::Unlimited => format!("{} / ∞", usage.amount),
-                                })
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                            )
-                            .into_any_element()
-                    },
-                    move |_, cx| cx.open_url(&zed_urls::account_url(cx)),
-                )
-                .separator();
-        }
 
         menu = menu.header("Show Edit Predictions For");
 
@@ -718,7 +701,109 @@ impl InlineCompletionButton {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<ContextMenu> {
-        ContextMenu::build(window, cx, |menu, window, cx| {
+        ContextMenu::build(window, cx, |mut menu, window, cx| {
+            if let Some(usage) = self
+                .edit_prediction_provider
+                .as_ref()
+                .and_then(|provider| provider.usage(cx))
+            {
+                menu = menu.header("Usage");
+                menu = menu
+                    .custom_entry(
+                        move |_window, cx| {
+                            let used_percentage = match usage.limit {
+                                UsageLimit::Limited(limit) => {
+                                    Some((usage.amount as f32 / limit as f32) * 100.)
+                                }
+                                UsageLimit::Unlimited => None,
+                            };
+
+                            h_flex()
+                                .flex_1()
+                                .gap_1p5()
+                                .children(
+                                    used_percentage.map(|percent| {
+                                        ProgressBar::new("usage", percent, 100., cx)
+                                    }),
+                                )
+                                .child(
+                                    Label::new(match usage.limit {
+                                        UsageLimit::Limited(limit) => {
+                                            format!("{} / {limit}", usage.amount)
+                                        }
+                                        UsageLimit::Unlimited => format!("{} / ∞", usage.amount),
+                                    })
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                                )
+                                .into_any_element()
+                        },
+                        move |_, cx| cx.open_url(&zed_urls::account_url(cx)),
+                    )
+                    .when(usage.over_limit(), |menu| -> ContextMenu {
+                        menu.entry("Subscribe to increase your limit", None, |_window, cx| {
+                            cx.open_url(&zed_urls::account_url(cx))
+                        })
+                    })
+                    .separator();
+            } else if self.user_store.read(cx).account_too_young() {
+                menu = menu
+                    .custom_entry(
+                        |_window, _cx| {
+                            h_flex()
+                                .gap_1()
+                                .child(
+                                    Icon::new(IconName::Warning)
+                                        .size(IconSize::Small)
+                                        .color(Color::Warning),
+                                )
+                                .child(
+                                    Label::new("Your GitHub account is less than 30 days old")
+                                        .size(LabelSize::Small)
+                                        .color(Color::Warning),
+                                )
+                                .into_any_element()
+                        },
+                        |_window, cx| cx.open_url(&zed_urls::account_url(cx)),
+                    )
+                    .entry(
+                        "You need to upgrade to Zed Pro or contact us.",
+                        None,
+                        |_window, cx| cx.open_url(&zed_urls::account_url(cx)),
+                    )
+                    .separator();
+            } else if self.user_store.read(cx).has_overdue_invoices() {
+                menu = menu
+                    .custom_entry(
+                        |_window, _cx| {
+                            h_flex()
+                                .gap_1()
+                                .child(
+                                    Icon::new(IconName::Warning)
+                                        .size(IconSize::Small)
+                                        .color(Color::Warning),
+                                )
+                                .child(
+                                    Label::new("You have an outstanding invoice")
+                                        .size(LabelSize::Small)
+                                        .color(Color::Warning),
+                                )
+                                .into_any_element()
+                        },
+                        |_window, cx| {
+                            cx.open_url(&zed_urls::account_url(cx))
+                        },
+                    )
+                    .entry(
+                        "Check your payment status or contact us at billing-support@zed.dev to continue using this feature.",
+                        None,
+                        |_window, cx| {
+                            cx.open_url(&zed_urls::account_url(cx))
+                        },
+                    )
+                    .separator();
+            }
+
             self.build_language_settings_menu(menu, window, cx).when(
                 cx.has_flag::<PredictEditsRateCompletionsFeatureFlag>(),
                 |this| this.action("Rate Completions", RateCompletions.boxed_clone()),
@@ -749,10 +834,6 @@ impl InlineCompletionButton {
         self.editor_focus_handle = Some(editor.focus_handle(cx));
 
         cx.notify();
-    }
-
-    pub fn toggle_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.popover_menu_handle.toggle(window, cx);
     }
 }
 
@@ -850,9 +931,14 @@ async fn open_disabled_globs_setting_in_editor(
                     .map(|inner_match| inner_match.start()..inner_match.end())
             });
             if let Some(range) = range {
-                item.change_selections(Some(Autoscroll::newest()), window, cx, |selections| {
-                    selections.select_ranges(vec![range]);
-                });
+                item.change_selections(
+                    SelectionEffects::scroll(Autoscroll::newest()),
+                    window,
+                    cx,
+                    |selections| {
+                        selections.select_ranges(vec![range]);
+                    },
+                );
             }
         })?;
 
@@ -883,6 +969,7 @@ fn toggle_show_inline_completions_for_language(
         all_language_settings(None, cx).show_edit_predictions(Some(&language), cx);
     update_settings_file::<AllLanguageSettings>(fs, cx, move |file, _| {
         file.languages
+            .0
             .entry(language.name())
             .or_default()
             .show_edit_predictions = Some(!show_edit_predictions);

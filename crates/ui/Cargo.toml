@@ -17,9 +17,9 @@ chrono.workspace = true
 component.workspace = true
 documented.workspace = true
 gpui.workspace = true
+gpui_macros.workspace = true
 icons.workspace = true
 itertools.workspace = true
-linkme.workspace = true
 menu.workspace = true
 serde.workspace = true
 settings.workspace = true
@@ -34,10 +34,9 @@ workspace-hack.workspace = true
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
 
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+
 [features]
 default = []
 stories = ["dep:story"]
-
-# cargo-machete doesn't understand that linkme is used in the component macro
-[package.metadata.cargo-machete]
-ignored = ["linkme"]
